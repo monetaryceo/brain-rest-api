@@ -1,0 +1,3 @@
+# Brain REST API — no external dependencies required (Python stdlib only)
+# To run: python server.py
+# Port: 8099 (override with PORT env var)
