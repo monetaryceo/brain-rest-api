@@ -1,0 +1,17 @@
+thebrain.137-184-23-228.sslip.io {
+    encode zstd gzip
+    @api path /v1/* /agent/v1/*
+    handle @api {
+        reverse_proxy 127.0.0.1:55210 {
+            header_up X-Brain-Public-Request 1
+        }
+    }
+    @brainapi path /brain-api/*
+    handle @brainapi {
+        uri strip_prefix /brain-api
+        reverse_proxy 127.0.0.1:8099
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8082
+    }
+}

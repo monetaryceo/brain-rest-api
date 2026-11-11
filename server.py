@@ -63,6 +63,9 @@ BILLION_CTX_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "billi
 BILLION_CTX_CONFIG_FILE = os.path.join(BILLION_CTX_CONFIG_DIR, "billion-context.json")
 _bili_proc = None  # holds the running billion-context proxy subprocess
 
+API_KEY = os.environ.get("BRAIN_API_KEY", "tFYk0cxOHPl_31VevnrcFgNYzGjEJHUgxjt0TLGzHe4")
+BRAIN_SERVER_NAME = "brain-rest-api"
+
 # ---------------------------------------------------------------------------
 # Model registry (from /opt/the-brain/short_names.json on brain-agent)
 # Each model: { id, object, created, owned_by, ... }
@@ -599,6 +602,18 @@ def now_ts():
 def make_id(prefix="cmpl"):
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
+
+
+def is_authenticated(handler):
+    """Check API key authentication via Authorization: Bearer <token> header."""
+    if not API_KEY:
+        return True
+    auth_header = handler.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        return token == API_KEY
+    return False
+
 def json_response(handler, code, body, content_type="application/json"):
     data = json.dumps(body).encode("utf-8")
     handler.send_response(code)
@@ -932,6 +947,10 @@ class BrainHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if not is_authenticated(self):
+            json_response(self, 401, {"error": {"message": "Missing or invalid API key", "type": "auth_error", "code": 401}})
+            return
+
         if path == "/v1/models":
             json_response(self, 200, models_list_response())
         elif path == "/v1/tools":
@@ -1060,6 +1079,10 @@ class BrainHandler(BaseHTTPRequestHandler):
                     "code": 400,
                 }
             })
+            return
+
+        if not is_authenticated(self):
+            json_response(self, 401, {"error": {"message": "Missing or invalid API key", "type": "auth_error", "code": 401}})
             return
 
         if path == "/v1/chat/completions":
