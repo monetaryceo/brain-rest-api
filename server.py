@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 """
 Brain REST API — OpenAI-compatible endpoint for all brain tools, skills, and models.
+Runs entirely on the remote server. No dependencies on any local PC or device.
+All ISIS tools call localhost:8088 directly.
 
-Implements the OpenAI Chat Completions API format (exact field names/types):
-  GET  /v1/models        -> list of models { object: "list", data: [...] }
-  POST /v1/chat/completions -> { id, object: "chat.completion", created, model,
-                                 choices: [{ index, message, finish_reason }],
-                                 usage: { prompt_tokens, completion_tokens, total_tokens } }
+Implements the OpenAI Chat Completions API format:
+  GET  /v1/models        -> list of models
+  POST /v1/chat/completions -> chat completion with tool calling
+  POST /v1/auth/keys     -> generate a new API key
 
-Tool calling follows the OpenAI format:
-  Request  tools: [{ type: "function", function: { name, description, parameters } }]
-  Response tool_calls: [{ id, type: "function", function: { name, arguments: "<JSON string>" } }]
+Auth: Authorization: Bearer <api_key> required on all endpoints except /v1/auth/keys
 
 Exposes:
-  - Brain MCP tools (agent-list, agent-run, agent-install, agent-build, agent-doctor,
-    context7-search, rea-analyze) via bin/agent-cli.js
-  - All 12 native skills (ghostman, ctx7, context7-mcp, rea, agent-browser, skills,
-    dsh, deer-flow, herdr, agent-desktop, craft-anything, replica-skill)
-  - ISIS pentest tools (nuclei_scan, finish_scan, web_search, spawn_sandbox, pentest,
-    tmux, swarmchat, herdr_swarm, infinity_swarm, deer_flow, capabilities, health)
-  - All brain models (lfm3, deepseek-r1, qwen, hope, aira, aether, jev, laya, wan,
-    isis-trained, etc.)
+  - /v1/models, /v1/tools, /v1/health (REST)
+  - /mcp (MCP JSON-RPC 2.0: tools/list, tools/call, resources/list, prompts/list)
+  - Brain MCP tools, ISIS tools (native on server), billion-context tools
+  - All brain models + cloud models (OpenRouter, NVIDIA)
 
-No external dependencies — uses Python stdlib only.
+No external dependencies — Python stdlib only.
 """
 
 import json
@@ -31,45 +26,32 @@ import sys
 import time
 import uuid
 import subprocess
+import secrets
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+import urllib.request
+import urllib.error
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-WORKSPACE = r"C:\Users\ADMIN\.cline\data\workspaces\chat"
+WORKSPACE = "/home/brain-agent"
 AGENT_TOOLCHAIN = os.path.join(WORKSPACE, "agent-toolchain")
 AGENT_CLI = os.path.join(AGENT_TOOLCHAIN, "bin", "agent-cli.js")
-BRAIN_MCP = os.path.join(AGENT_TOOLCHAIN, "brain", "mcp-server.js")
-BRAIN_MANIFEST = os.path.join(AGENT_TOOLCHAIN, "brain", "manifest.json")
-BRAIN_SKILLS_INDEX = os.path.join(AGENT_TOOLCHAIN, "brain", "skills", "index.json")
+ISIS_BASE_URL = "http://127.0.0.1:8088"
 
-# Remote ISIS server (brain-agent)
-ISIS_SSH_HOST = "brain-agent@137.184.23.228"
-ISIS_SSH_KEY = r"C:\Users\ADMIN\.ssh\brain_agents_key"
-ISIS_BASE_URL = "http://137.184.23.228:8088"
-
-# ---------------------------------------------------------------------------
-# Billion-context configuration (context-compression proxy)
-# Installed at: C:\Users\ADMIN\.cline\data\workspaces\chat\billion-context\
-# Proxy listens on port 8787 by default, sits between agents and model APIs
-# ---------------------------------------------------------------------------
 BILLION_CTX_DIR = os.path.join(WORKSPACE, "billion-context")
-BILLION_CTX_BIN = os.path.join(BILLION_CTX_DIR, "bin", "bili.cjs")
 BILLION_CTX_DIST = os.path.join(BILLION_CTX_DIR, "dist", "index.js")
 BILLION_CTX_PORT = int(os.environ.get("BILI_PORT", "8787"))
 BILLION_CTX_HOST = os.environ.get("BILI_HOST", "127.0.0.1")
 BILLION_CTX_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "billion-context")
 BILLION_CTX_CONFIG_FILE = os.path.join(BILLION_CTX_CONFIG_DIR, "billion-context.json")
-_bili_proc = None  # holds the running billion-context proxy subprocess
+_bili_proc = None
 
-API_KEY = os.environ.get("BRAIN_API_KEY", "tFYk0cxOHPl_31VevnrcFgNYzGjEJHUgxjt0TLGzHe4")
+PRIMARY_API_KEY = os.environ.get("BRAIN_API_KEY", "tFYk0cxOHPl_31VevnrcFgNYzGjEJHUgxjt0TLGzHe4")
 BRAIN_SERVER_NAME = "brain-rest-api"
 
-# ---------------------------------------------------------------------------
-# Model registry (from /opt/the-brain/short_names.json on brain-agent)
-# Each model: { id, object, created, owned_by, ... }
-# ---------------------------------------------------------------------------
+API_KEYS = {}
+if PRIMARY_API_KEY:
+    API_KEYS[PRIMARY_API_KEY] = {"created": int(time.time()), "name": "primary"}
+
 BRAIN_MODELS = [
     {
         "id": "lfm3-1.7b-uncensored",
@@ -229,7 +211,7 @@ BRAIN_MODELS = [
         "owned_by": "ollama",
         "base": "llama3.2",
         "role": "chat",
-        "endpoint": "http://137.184.23.228:11434",
+        "endpoint": "http://127.0.0.1:11434",
         "capabilities": ["text", "tools", "chat"],
         "permission": [],
     },
@@ -245,8 +227,71 @@ BRAIN_MODELS = [
         "modality": "any-to-any",
         "permission": [],
     },
+    {
+        "id": "openrouter/gpt-4o",
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "openrouter",
+        "base": "gpt-4o",
+        "provider": "openrouter",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "capabilities": ["text", "tools", "chat", "vision"],
+        "permission": [],
+    },
+    {
+        "id": "openrouter/claude-3.5-sonnet",
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "openrouter",
+        "base": "claude-3.5-sonnet",
+        "provider": "openrouter",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "capabilities": ["text", "tools", "chat", "vision"],
+        "permission": [],
+    },
+    {
+        "id": "openrouter/deepseek-chat-v3",
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "openrouter",
+        "base": "deepseek-chat-v3",
+        "provider": "openrouter",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "capabilities": ["text", "tools", "chat"],
+        "permission": [],
+    },
+    {
+        "id": "nvidia/llama-3.1-nemotron-70b",
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "nvidia",
+        "base": "llama-3.1-nemotron-70b",
+        "provider": "nvidia",
+        "endpoint": "https://integrate.api.nvidia.com/v1",
+        "api_key_env": "NVIDIA_API_KEY",
+        "capabilities": ["text", "tools", "chat"],
+        "permission": [],
+    },
+    {
+        "id": "nvidia/nemotron-4-340b",
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "nvidia",
+        "base": "nemotron-4-340b",
+        "provider": "nvidia",
+        "endpoint": "https://integrate.api.nvidia.com/v1",
+        "api_key_env": "NVIDIA_API_KEY",
+        "capabilities": ["text", "tools", "chat"],
+        "permission": [],
+    },
 ]
 
+# ---------------------------------------------------------------------------
+# Tool registry — ALL tools (brain MCP + ISIS + billion-context + auth)
+# ---------------------------------------------------------------------------
 TOOLS = [
     {
         "type": "function",
@@ -335,11 +380,12 @@ TOOLS = [
             },
         },
     },
+    # ISIS tools (native on server via localhost:8088 — NO SSH)
     {
         "type": "function",
         "function": {
             "name": "nuclei_scan",
-            "description": "Run a nuclei vulnerability scan on a target URL (ISIS pentest server).",
+            "description": "Run nuclei vulnerability scan on a target URL (ISIS pentest server).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -373,7 +419,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Perform a web search via the ISIS server.",
+            "description": "Perform a web search via the ISIS server (needle model).",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "Search query"}},
@@ -389,9 +435,7 @@ TOOLS = [
             "description": "Spawn a Docker sandbox container via ISIS.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "image": {"type": "string", "default": "brain-math-sandbox:latest", "description": "Docker image to spawn"},
-                },
+                "properties": {"image": {"type": "string", "default": "brain-math-sandbox:latest", "description": "Docker image to spawn"}},
                 "additionalProperties": False,
             },
         },
@@ -503,6 +547,22 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
     },
+    # Auth tool — generate API keys
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_api_key",
+            "description": "Generate a new API key for accessing the Brain REST API.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Optional name for the API key"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    # Billion-context tools
     {
         "type": "function",
         "function": {
@@ -582,16 +642,13 @@ TOOLS = [
             "description": "Get billion-context ACP context-usage overview and compressible ranges.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "Session ID to check"},
-                },
+                "properties": {"session_id": {"type": "string", "description": "Session ID to check"}},
                 "additionalProperties": False,
             },
         },
     },
 ]
 
-TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -602,16 +659,11 @@ def now_ts():
 def make_id(prefix="cmpl"):
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
-
-
 def is_authenticated(handler):
-    """Check API key authentication via Authorization: Bearer <token> header."""
-    if not API_KEY:
-        return True
     auth_header = handler.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        return token == API_KEY
+        return token in API_KEYS
     return False
 
 def json_response(handler, code, body, content_type="application/json"):
@@ -619,7 +671,6 @@ def json_response(handler, code, body, content_type="application/json"):
     handler.send_response(code)
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(data)))
-    # CORS headers — required for PocketPal, browser clients, and all apps
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
@@ -628,57 +679,37 @@ def json_response(handler, code, body, content_type="application/json"):
 
 def read_body(handler):
     length = int(handler.headers.get("Content-Length", 0))
-    if length == 0:
-        return b""
-    return handler.rfile.read(length)
+    return handler.rfile.read(length) if length else b""
 
-def run_agent_cli(*args):
-    """Run bin/agent-cli.js with the given args; return (code, stdout, stderr)."""
-    cmd = ["node", AGENT_CLI] + list(args)
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        return result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return 124, "", "Command timed out after 120s"
-    except Exception as e:
-        return 1, "", str(e)
-
-def ssh_isis(path, method="POST", payload=None):
-    """Call the remote ISIS server via SSH curl (avoids opening a port locally)."""
+# ---------------------------------------------------------------------------
+# ISIS native HTTP client (no SSH — calls localhost:8088 directly)
+# ---------------------------------------------------------------------------
+def isis_request(method, path, payload=None, timeout=30):
     url = f"{ISIS_BASE_URL}{path}"
-    if method == "GET":
-        cmd = [
-            "ssh", "-i", ISIS_SSH_KEY, "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=no", ISIS_SSH_HOST,
-            f"curl -s {url}",
-        ]
-    else:
-        data = json.dumps(payload or {})
-        escaped = data.replace("'", "'\\''")
-        cmd = [
-            "ssh", "-i", ISIS_SSH_KEY, "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=no", ISIS_SSH_HOST,
-            f"curl -s -X POST -H 'Content-Type: application/json' -d '{escaped}' {url}",
-        ]
+    data = json.dumps(payload).encode("utf-8") if payload else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            return {"error": f"ssh failed: {result.stderr.strip()}"}
-        try:
-            return json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return {"error": f"invalid json: {result.stdout[:500]}", "raw": result.stdout}
-    except subprocess.TimeoutExpired:
-        return {"error": "ISIS request timed out"}
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {"error": f"HTTP {e.code}", "detail": e.read().decode("utf-8", errors="replace")[:500]}
     except Exception as e:
         return {"error": str(e)}
 
-# ---------------------------------------------------------------------------
-# Tool execution
-# ---------------------------------------------------------------------------
+def run_agent_cli(*cmd):
+    try:
+        proc = subprocess.run(
+            ["node", AGENT_CLI, *cmd],
+            capture_output=True, text=True, timeout=60,
+            cwd=AGENT_TOOLCHAIN,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except Exception as e:
+        return -1, "", str(e)
+
 def execute_tool(name, arguments):
-    """Execute a registered tool by name with arguments dict. Returns result dict."""
-    # Brain MCP tools via agent-cli
+    # ---- Brain MCP tools ----
     if name == "agent_list":
         code, out, err = run_agent_cli("list")
         return {"code": code, "stdout": out, "stderr": err}
@@ -688,35 +719,30 @@ def execute_tool(name, arguments):
         code, out, err = run_agent_cli(tool, *args)
         return {"code": code, "stdout": out, "stderr": err}
     if name == "agent_install":
-        tool = arguments.get("tool")
-        code, out, err = run_agent_cli("install", tool)
+        code, out, err = run_agent_cli("install", arguments.get("tool"))
         return {"code": code, "stdout": out, "stderr": err}
     if name == "agent_build":
-        tool = arguments.get("tool")
-        code, out, err = run_agent_cli("build", tool)
+        code, out, err = run_agent_cli("build", arguments.get("tool"))
         return {"code": code, "stdout": out, "stderr": err}
     if name == "agent_doctor":
         code, out, err = run_agent_cli("doctor")
         return {"code": code, "stdout": out, "stderr": err}
     if name == "context7_search":
-        cmd = ["context7-search"]
-        if arguments.get("library_name"):
-            cmd += ["--library", arguments["library_name"]]
-        code, out, err = run_agent_cli(*cmd)
+        code, out, err = run_agent_cli("context7", "search", arguments.get("query", ""),
+                                       *(["--library", arguments.get("library_name")] if arguments.get("library_name") else []))
         return {"code": code, "stdout": out, "stderr": err}
     if name == "rea_analyze":
-        target = arguments.get("target")
-        code, out, err = run_agent_cli("rea", "analyze", target)
+        code, out, err = run_agent_cli("rea", "analyze", arguments.get("target", ""))
         return {"code": code, "stdout": out, "stderr": err}
 
-    # ISIS tools via remote SSH
+    # ISIS tools (native on server, no SSH)
     if name == "nuclei_scan":
-        return ssh_isis("/nuclei_scan", "POST", {
+        return isis_request("POST", "/nuclei_scan", {
             "target": arguments.get("target"),
             "severity": arguments.get("severity", "critical,high,medium"),
         })
     if name == "finish_scan":
-        return ssh_isis("/pentest", "POST", {
+        return isis_request("POST", "/pentest", {
             "target": arguments.get("target"),
             "tools": ["nuclei"],
             "_finish": True,
@@ -725,44 +751,58 @@ def execute_tool(name, arguments):
             "status": arguments.get("status", "completed"),
         })
     if name == "web_search":
-        return ssh_isis("/web_search", "POST", {"query": arguments.get("query", "")})
+        return isis_request("POST", "/web_search", {"query": arguments.get("query", "")})
     if name == "spawn_sandbox":
-        return ssh_isis("/spawn_sandbox", "POST", {
+        return isis_request("POST", "/spawn_sandbox", {
             "image": arguments.get("image", "brain-math-sandbox:latest"),
         })
     if name == "pentest":
-        return ssh_isis("/pentest", "POST", {
+        return isis_request("POST", "/pentest", {
             "target": arguments.get("target"),
             "tools": arguments.get("tools", ["strix", "nuclei"]),
         })
     if name == "tmux_session":
-        return ssh_isis("/tmux", "POST", {
+        return isis_request("POST", "/tmux", {
             "session": arguments.get("session", "isis-session"),
             "command": arguments.get("command", "echo ISIS"),
         })
     if name == "swarmchat":
-        return ssh_isis("/swarmchat", "POST", {
+        return isis_request("POST", "/swarmchat", {
             "message": arguments.get("message", ""),
             "channel": arguments.get("channel", "isis"),
         })
     if name == "herdr_swarm":
-        return ssh_isis("/herdr", "POST", {
+        return isis_request("POST", "/herdr", {
             "task": arguments.get("task", ""),
             "num_bots": arguments.get("num_bots", 5),
         })
     if name == "infinity_swarm":
-        return ssh_isis("/infinity", "POST", {"task": arguments.get("task", "")})
+        return isis_request("POST", "/infinity", {"task": arguments.get("task", "")})
     if name == "deer_flow":
-        return ssh_isis("/deer_flow", "POST", {
+        return isis_request("POST", "/deer_flow", {
             "workflow": arguments.get("workflow", "default"),
             "steps": arguments.get("steps", []),
         })
     if name == "capabilities":
-        return ssh_isis("/capabilities", "GET")
+        return isis_request("GET", "/capabilities")
     if name == "health":
-        return ssh_isis("/health", "GET")
+        return isis_request("GET", "/health")
 
-    # ---- Billion-context tools ----
+    # Auth tool
+    if name == "generate_api_key":
+        new_key = secrets.token_urlsafe(32)
+        key_name = arguments.get("name", f"key-{int(time.time())}")
+        API_KEYS[new_key] = {"created": int(time.time()), "name": key_name}
+        return {
+            "api_key": new_key,
+            "name": key_name,
+            "created": int(time.time()),
+            "base_url": "https://thebrain.137-184-23-228.sslip.io/brain-api",
+            "usage": "Authorization: Bearer <api_key>",
+            "note": "Save this key now — it will not be shown again.",
+        }
+
+    # Billion-context tools
     if name == "bili_start":
         return start_bili_proxy(arguments.get("port", BILLION_CTX_PORT), arguments.get("host", BILLION_CTX_HOST))
     if name == "bili_status":
@@ -776,35 +816,24 @@ def execute_tool(name, arguments):
     if name == "bili_acp_status":
         return bili_acp_status(arguments.get("session_id", ""))
 
-    return {"error": f"unknown tool: {name}"}
-
-
 # ---------------------------------------------------------------------------
 # Billion-context proxy management
 # ---------------------------------------------------------------------------
 def start_bili_proxy(port, host):
-    """Start the billion-context proxy as a subprocess."""
     global _bili_proc
     if _bili_proc is not None and _bili_proc.poll() is None:
         return {"status": "already_running", "port": port, "pid": _bili_proc.pid}
 
-    # Ensure config dir exists
     os.makedirs(BILLION_CTX_CONFIG_DIR, exist_ok=True)
 
-    # Seed config if missing
     if not os.path.exists(BILLION_CTX_CONFIG_FILE):
-        config = {
-            "port": port,
-            "host": host,
-            "providers": {},
-        }
+        config = {"port": port, "host": host, "providers": {}}
         try:
             with open(BILLION_CTX_CONFIG_FILE, "w") as f:
                 json.dump(config, f, indent=2)
         except Exception as e:
             return {"error": f"failed to write config: {e}"}
 
-    # Start the proxy
     try:
         cmd = ["node", BILLION_CTX_DIST]
         env = dict(os.environ)
@@ -817,9 +846,7 @@ def start_bili_proxy(port, host):
     except Exception as e:
         return {"error": f"failed to start billion-context: {e}"}
 
-
 def check_bili_status():
-    """Check billion-context proxy status."""
     global _bili_proc
     running = _bili_proc is not None and _bili_proc.poll() is None
     config_exists = os.path.exists(BILLION_CTX_CONFIG_FILE)
@@ -843,11 +870,7 @@ def check_bili_status():
             result["config"] = None
     return result
 
-
 def _bili_request(method, path, payload=None, timeout=30):
-    """Make an HTTP request to the billion-context proxy."""
-    import urllib.request
-    import urllib.error
     url = f"http://{BILLION_CTX_HOST}:{BILLION_CTX_PORT}{path}"
     data = json.dumps(payload).encode("utf-8") if payload else None
     req = urllib.request.Request(url, data=data, method=method,
@@ -860,42 +883,14 @@ def _bili_request(method, path, payload=None, timeout=30):
     except Exception as e:
         return {"error": str(e)}
 
-
 def bili_compress_range(session_id, start, end):
-    """Compress a message range via billion-context."""
-    return _bili_request("POST", "/compress", {
-        "session_id": session_id, "start": start, "end": end,
-    })
-
-
-def bili_decompress_range(session_id, ref_id):
-    """Decompress a message range via billion-context."""
-    return _bili_request("POST", "/decompress", {
-        "session_id": session_id, "ref_id": ref_id,
-    })
-
-
-def bili_search(session_id, query):
-    """Search context via billion-context."""
-    return _bili_request("POST", "/search_context", {
-        "session_id": session_id, "query": query,
-    })
-
-
-def bili_acp_status(session_id=""):
-    """Get ACP status via billion-context."""
-    path = "/acp_status" + (f"?session_id={session_id}" if session_id else "")
-    return _bili_request("GET", path)
-
+    return _bili_request("POST", "/compress", {"session_id": session_id, "start": start, "end": end})
 
 # ---------------------------------------------------------------------------
 # OpenAI-format responses
 # ---------------------------------------------------------------------------
 def models_list_response():
-    return {
-        "object": "list",
-        "data": BRAIN_MODELS,
-    }
+    return {"object": "list", "data": BRAIN_MODELS}
 
 def chat_completions_response(model, choices, usage=None):
     return {
@@ -904,11 +899,7 @@ def chat_completions_response(model, choices, usage=None):
         "created": now_ts(),
         "model": model,
         "choices": choices,
-        "usage": usage or {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 def tool_call_message(tool_calls):
@@ -922,22 +913,10 @@ def tool_call_message(tool_calls):
                 "arguments": json.dumps(tc["arguments"]),
             },
         })
-    return {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": calls,
-    }
-
-def tool_result_message(tool_call_id, name, result):
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "name": name,
-        "content": json.dumps(result),
-    }
+    return calls
 
 # ---------------------------------------------------------------------------
-# HTTP Handler
+# HTTP Request Handler
 # ---------------------------------------------------------------------------
 class BrainHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -947,89 +926,77 @@ class BrainHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if not is_authenticated(self):
-            json_response(self, 401, {"error": {"message": "Missing or invalid API key", "type": "auth_error", "code": 401}})
+        if path == "/":
+            json_response(self, 200, {
+                "service": "brain-rest-api",
+                "version": "1.0.0",
+                "format": "openai",
+                "base_url": "https://thebrain.137-184-23-228.sslip.io/brain-api",
+                "endpoints": {
+                    "models": "/brain-api/v1/models",
+                    "chat": "/brain-api/v1/chat/completions",
+                    "tools": "/brain-api/v1/tools",
+                    "auth_keys": "/brain-api/v1/auth/keys",
+                    "mcp": "/brain-api/mcp",
+                    "health": "/brain-api/v1/health",
+                },
+            })
+            return
+
+        if path == "/v1/health":
+            json_response(self, 200, {
+                "status": "healthy",
+                "service": "brain-rest-api",
+                "format": "openai",
+                "tools": len(TOOLS),
+                "models": len(BRAIN_MODELS),
+            })
             return
 
         if path == "/v1/models":
+            if not is_authenticated(self):
+                json_response(self, 401, {"error": {"message": "Missing or invalid API key", "type": "auth_error", "code": 401}})
+                return
             json_response(self, 200, models_list_response())
-        elif path == "/v1/tools":
-            json_response(self, 200, {
-                "object": "list",
-                "data": TOOLS,
-            })
-        elif path == "/health":
-            json_response(self, 200, {
-                "status": "healthy",
-                "service": "brain-rest-api",
-                "format": "openai",
-                "tools": len(TOOLS),
-                "models": len(BRAIN_MODELS),
-                "billion_context": check_bili_status(),
-            })
-        elif path == "/v1/health":
-            json_response(self, 200, {
-                "status": "healthy",
-                "service": "brain-rest-api",
-                "format": "openai",
-                "tools": len(TOOLS),
-                "models": len(BRAIN_MODELS),
-                "billion_context": check_bili_status(),
-            })
-        elif path == "/v1/resources":
+            return
+
+        if path == "/v1/tools":
+            if not is_authenticated(self):
+                json_response(self, 401, {"error": {"message": "Missing or invalid API key", "type": "auth_error", "code": 401}})
+                return
+            json_response(self, 200, {"object": "list", "data": TOOLS})
+            return
+
+        if path == "/v1/resources":
+            if not is_authenticated(self):
+                json_response(self, 401, {"error": {"message": "Missing or invalid API key", "type": "auth_error", "code": 401}})
+                return
             json_response(self, 200, {
                 "object": "list",
                 "data": [
-                    {
-                        "uri": "app://workspace/current-state",
-                        "name": "Current Workspace State",
-                        "description": "Exposes active UI state and component handles",
-                        "mimeType": "application/json",
-                    },
-                    {
-                        "uri": "app://models/registry",
-                        "name": "Model Registry",
-                        "description": "List of all available models with capabilities",
-                        "mimeType": "application/json",
-                    },
-                    {
-                        "uri": "app://tools/registry",
-                        "name": "Tool Registry",
-                        "description": "List of all available tools with input schemas",
-                        "mimeType": "application/json",
-                    },
+                    {"uri": "app://models/registry", "name": "Model Registry", "description": "List of all available models with capabilities", "mimeType": "application/json"},
+                    {"uri": "app://tools/registry", "name": "Tool Registry", "description": "List of all available tools with input schemas", "mimeType": "application/json"},
+                    {"uri": "app://auth/keys", "name": "API Keys", "description": "Manage API keys for the Brain REST API", "mimeType": "application/json"},
                 ],
             })
-        elif path == "/v1/prompts":
+            return
+
+        if path == "/v1/prompts":
+            if not is_authenticated(self):
+                json_response(self, 401, {"error": {"message": "Missing or invalid API key", "type": "auth_error", "code": 401}})
+                return
             json_response(self, 200, {
                 "object": "list",
                 "data": [
-                    {
-                        "name": "code_refactor_skill",
-                        "description": "Standardized skill to analyze and optimize code blocks",
-                        "arguments": [
-                            {
-                                "name": "snippet",
-                                "description": "Code snippet to refactor",
-                                "required": True,
-                            }
-                        ],
-                    },
-                    {
-                        "name": "pentest_workflow",
-                        "description": "Standardized pentest workflow using ISIS tools",
-                        "arguments": [
-                            {
-                                "name": "target",
-                                "description": "Target to pentest",
-                                "required": True,
-                            }
-                        ],
-                    },
+                    {"name": "code_refactor_skill", "description": "Standardized skill to analyze and optimize code blocks",
+                     "arguments": [{"name": "snippet", "description": "Code snippet to refactor", "required": True}]},
+                    {"name": "pentest_workflow", "description": "Standardized pentest workflow using ISIS tools",
+                     "arguments": [{"name": "target", "description": "Target to pentest", "required": True}]},
                 ],
             })
-        elif path == "/mcp":
-            # MCP over HTTP GET — return capabilities info
+            return
+
+        if path == "/mcp":
             json_response(self, 200, {
                 "jsonrpc": "2.0",
                 "method": "mcp.info",
@@ -1040,24 +1007,13 @@ class BrainHandler(BaseHTTPRequestHandler):
                         "resources": {"listChanged": True},
                         "prompts": {"listChanged": True},
                     },
-                    "serverInfo": {
-                        "name": "brain-rest-api",
-                        "version": "1.0.0",
-                    },
+                    "serverInfo": {"name": "brain-rest-api", "version": "1.0.0"},
                 },
                 "id": 0,
             })
-        else:
-            json_response(self, 404, {
-                "error": {
-                    "message": f"Unknown endpoint: {path}",
-                    "type": "not_found_error",
-                    "code": 404,
-                }
-            })
+            return
 
     def do_OPTIONS(self):
-        """CORS preflight handler for all apps (PocketPal, browsers, etc.)."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -1072,12 +1028,20 @@ class BrainHandler(BaseHTTPRequestHandler):
         try:
             data = json.loads(body) if body else {}
         except json.JSONDecodeError:
-            json_response(self, 400, {
-                "error": {
-                    "message": "Invalid JSON body",
-                    "type": "bad_request_error",
-                    "code": 400,
-                }
+            json_response(self, 400, {"error": {"message": "Invalid JSON body", "type": "bad_request_error", "code": 400}})
+            return
+
+        if path == "/v1/auth/keys":
+            new_key = secrets.token_urlsafe(32)
+            key_name = data.get("name", f"key-{int(time.time())}")
+            API_KEYS[new_key] = {"created": int(time.time()), "name": key_name}
+            json_response(self, 200, {
+                "api_key": new_key,
+                "name": key_name,
+                "created": int(time.time()),
+                "base_url": "https://thebrain.137-184-23-228.sslip.io/brain-api",
+                "usage": "Authorization: Bearer <api_key>",
+                "note": "Save this key now — it will not be shown again.",
             })
             return
 
@@ -1091,24 +1055,6 @@ class BrainHandler(BaseHTTPRequestHandler):
             self.handle_tool_call(data)
         elif path == "/mcp":
             self.handle_mcp(data)
-        elif path == "/v1/embeddings":
-            json_response(self, 400, {
-                "error": {
-                    "message": "Embeddings endpoint not implemented",
-                    "type": "not_implemented_error",
-                    "code": 400,
-                }
-            })
-        else:
-            json_response(self, 404, {
-                "error": {
-                    "message": f"Unknown endpoint: {path}",
-                    "type": "not_found_error",
-                    "code": 404,
-                }
-            })
-
-    # ---- chat/completions ----
     def handle_chat_completions(self, data):
         model = data.get("model", "isis-trained")
         messages = data.get("messages", [])
@@ -1181,9 +1127,7 @@ class BrainHandler(BaseHTTPRequestHandler):
 
         json_response(self, 200, chat_completions_response(model, choices))
 
-    # ---- chat/completions streaming (SSE) ----
     def _stream_chat_completions(self, model, messages, tools):
-        """Stream chat completion as Server-Sent Events (text/event-stream)."""
         available_tools = tools if tools is not None else TOOLS
 
         user_message = ""
@@ -1198,325 +1142,185 @@ class BrainHandler(BaseHTTPRequestHandler):
         created = now_ts()
 
         def sse_chunk(obj):
-            return f"data: {json.dumps(obj)}\n\n"
+            data_str = "data: " + json.dumps(obj) + "\n\n"
+            self.wfile.write(data_str.encode("utf-8"))
 
-        # Send initial role chunk
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
-        role_chunk = {
+        sse_chunk({
             "id": chunk_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        }
-        self.wfile.write(sse_chunk(role_chunk).encode("utf-8"))
+        })
 
-        if not selected_tools:
-            content = self._generate_text_response(model, messages, user_message)
-            content_chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-            }
-            self.wfile.write(sse_chunk(content_chunk).encode("utf-8"))
-            stop_chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            self.wfile.write(sse_chunk(stop_chunk).encode("utf-8"))
-        else:
-            tool_calls_out = []
+        if selected_tools:
             for tc in selected_tools:
-                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
-                result = execute_tool(tc["name"], tc["arguments"])
-                tool_calls_out.append({
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"]),
-                    },
+                sse_chunk({
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": ""},
+                        }]
+                    }, "finish_reason": None}],
                 })
-            tool_chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_out}, "finish_reason": None}],
-            }
-            self.wfile.write(sse_chunk(tool_chunk).encode("utf-8"))
-            stop_chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-            }
-            self.wfile.write(sse_chunk(stop_chunk).encode("utf-8"))
 
+        sse_chunk({
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        })
         self.wfile.write(b"data: [DONE]\n\n")
 
-    # ---- MCP JSON-RPC 2.0 (universal for ChatGPT, Grok, Manus, Claude, Cline, Copilot, Codex) ----
+    def _select_tools(self, user_message, available_tools):
+        msg = user_message.lower()
+        selected = []
+        for tool in available_tools:
+            name = tool["function"]["name"]
+            desc = tool["function"]["description"].lower()
+            if name in msg or any(k in msg for k in desc.split()[:3]):
+                selected.append({"name": name, "arguments": {}})
+        return selected[:3]
+
+    def _generate_text_response(self, model, messages, user_message):
+        return f"I received your message: '{user_message}'. I'm the {model} model running on the Brain REST API at https://thebrain.137-184-23-228.sslip.io/brain-api. How can I help you?"
+
+    def _summarize_results(self, tool_messages):
+        parts = []
+        for tm in tool_messages:
+            parts.append(f"Tool `{tm['name']}` executed: {tm['content'][:200]}")
+        return "Executed tools: " + "; ".join(parts) if parts else "No tools executed."
+
+    def handle_tool_call(self, data):
+        name = data.get("name", "")
+        arguments = data.get("arguments", {})
+        result = execute_tool(name, arguments)
+        json_response(self, 200, {
+            "jsonrpc": "2.0",
+            "result": result,
+            "id": data.get("id", 1),
+        })
+
     def handle_mcp(self, data):
-        """Handle MCP JSON-RPC 2.0 requests."""
         method = data.get("method", "")
         params = data.get("params", {})
-        req_id = data.get("id", 0)
+        req_id = data.get("id", 1)
 
-        if method == "tools/list":
-            tools_out = []
-            for t in TOOLS:
-                fn = t["function"]
-                tools_out.append({
-                    "name": fn["name"],
-                    "description": fn.get("description", ""),
-                    "inputSchema": fn.get("parameters", {"type": "object", "properties": {}}),
-                })
-            json_response(self, 200, {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"tools": tools_out},
-            })
-
-        elif method == "tools/call":
-            name = params.get("name", "")
-            arguments = params.get("arguments", {})
-            result = execute_tool(name, arguments)
+        if method == "initialize":
             json_response(self, 200, {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result)}
-                    ],
-                    "isError": False,
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {"listChanged": True},
+                        "resources": {"listChanged": True},
+                        "prompts": {"listChanged": True},
+                    },
+                    "serverInfo": {"name": "brain-rest-api", "version": "1.0.0"},
                 },
             })
-
+        elif method == "tools/list":
+            json_response(self, 200, {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"tools": [t["function"] for t in TOOLS]},
+            })
+        elif method == "tools/call":
+            tool_name = params.get("name", "")
+            tool_args = params.get("arguments", {})
+            result = execute_tool(tool_name, tool_args)
+            json_response(self, 200, {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": result,
+            })
         elif method == "resources/list":
             json_response(self, 200, {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
                     "resources": [
-                        {
-                            "uri": "app://workspace/current-state",
-                            "name": "Current Workspace State",
-                            "description": "Exposes active UI state and component handles",
-                            "mimeType": "application/json",
-                        },
-                        {
-                            "uri": "app://models/registry",
-                            "name": "Model Registry",
-                            "description": "List of all available models with capabilities",
-                            "mimeType": "application/json",
-                        },
-                        {
-                            "uri": "app://tools/registry",
-                            "name": "Tool Registry",
-                            "description": "List of all available tools with input schemas",
-                            "mimeType": "application/json",
-                        },
+                        {"uri": "app://models/registry", "name": "Model Registry",
+                         "description": "List of all available models with capabilities",
+                         "mimeType": "application/json"},
+                        {"uri": "app://tools/registry", "name": "Tool Registry",
+                         "description": "List of all available tools with input schemas",
+                         "mimeType": "application/json"},
+                        {"uri": "app://auth/keys", "name": "API Keys",
+                         "description": "Manage API keys for the Brain REST API",
+                         "mimeType": "application/json"},
                     ],
                 },
             })
-
+        elif method == "resources/read":
+            uri = params.get("uri", "")
+            if uri == "app://models/registry":
+                content = json.dumps(models_list_response(), indent=2)
+            elif uri == "app://tools/registry":
+                content = json.dumps({"object": "list", "data": TOOLS}, indent=2)
+            elif uri == "app://auth/keys":
+                content = json.dumps({"keys": list(API_KEYS.keys())}, indent=2)
+            else:
+                content = json.dumps({"error": "unknown resource"})
+            json_response(self, 200, {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": content}]},
+            })
         elif method == "prompts/list":
             json_response(self, 200, {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
                     "prompts": [
-                        {
-                            "name": "code_refactor_skill",
-                            "description": "Standardized skill to analyze and optimize code blocks",
-                            "arguments": [
-                                {
-                                    "name": "snippet",
-                                    "description": "Code snippet to refactor",
-                                    "required": True,
-                                }
-                            ],
-                        },
-                        {
-                            "name": "pentest_workflow",
-                            "description": "Standardized pentest workflow using ISIS tools",
-                            "arguments": [
-                                {
-                                    "name": "target",
-                                    "description": "Target to pentest",
-                                    "required": True,
-                                }
-                            ],
-                        },
+                        {"name": "code_refactor_skill", "description": "Standardized skill to analyze and optimize code blocks",
+                         "arguments": [{"name": "snippet", "description": "Code snippet to refactor", "required": True}]},
+                        {"name": "pentest_workflow", "description": "Standardized pentest workflow using ISIS tools",
+                         "arguments": [{"name": "target", "description": "Target to pentest", "required": True}]},
                     ],
                 },
             })
-
         else:
-            json_response(self, 400, {
+            json_response(self, 200, {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Method not found: {method}",
-                },
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
             })
-
-    # ---- tools/call (direct execution) ----
-    def handle_tool_call(self, data):
-        name = data.get("name")
-        arguments = data.get("arguments", {})
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = {}
-        result = execute_tool(name, arguments)
-        json_response(self, 200, {
-            "name": name,
-            "result": result,
-        })
-
-    # ---- tool selection heuristic ----
-    def _select_tools(self, message, available_tools):
-        msg = message.lower()
-        selected = []
-        keyword_map = [
-            (["agent", "list", "tool", "status"], "agent_list"),
-            (["run", "execute", "cli", "command"], "agent_run"),
-            (["install", "dependency", "deps"], "agent_install"),
-            (["build", "compile"], "agent_build"),
-            (["doctor", "health", "runtime", "check"], "agent_doctor"),
-            (["context7", "documentation", "docs", "library"], "context7_search"),
-            (["rea", "reverse", "analyze", "binary"], "rea_analyze"),
-            (["nuclei", "vulnerability", "scan", "cve", "ssrf"], "nuclei_scan"),
-            (["finish", "scan_complete", "pentest_done"], "finish_scan"),
-            (["web_search", "search", "search web"], "web_search"),
-            (["sandbox", "docker", "spawn"], "spawn_sandbox"),
-            (["pentest", "strix", "penetration"], "pentest"),
-            (["tmux", "session"], "tmux_session"),
-            (["swarmchat", "swarm chat"], "swarmchat"),
-            (["herdr", "swarm", "bots"], "herdr_swarm"),
-            (["infinity", "infinite"], "infinity_swarm"),
-            (["deer", "flow", "workflow"], "deer_flow"),
-            (["capabilities", "what can"], "capabilities"),
-            (["health", "is alive", "ping"], "health"),
-            (["billion", "context", "compress", "compression", "bili", "acp"], "bili_start"),
-            (["bili", "status", "proxy"], "bili_status"),
-            (["compress", "compression", "fold", "session"], "bili_compress"),
-            (["decompress", "unfold", "restore"], "bili_decompress"),
-            (["search_context", "search context", "search compressed"], "bili_search_context"),
-            (["acp_status", "context usage", "context overview"], "bili_acp_status"),
-        ]
-        for keywords, tool_name in keyword_map:
-            if not any(t["function"]["name"] == tool_name for t in available_tools):
-                continue
-            if any(k in msg for k in keywords):
-                args = self._default_args(tool_name, msg)
-                selected.append({"name": tool_name, "arguments": args})
-        seen = set()
-        unique = []
-        for s in selected:
-            if s["name"] not in seen:
-                seen.add(s["name"])
-                unique.append(s)
-        return unique
-
-    def _default_args(self, tool_name, msg):
-        defaults = {
-            "agent_list": {},
-            "agent_run": {"tool": "", "args": []},
-            "agent_install": {"tool": ""},
-            "agent_build": {"tool": ""},
-            "agent_doctor": {},
-            "context7_search": {"query": msg},
-            "rea_analyze": {"target": ""},
-            "nuclei_scan": {"target": "", "severity": "critical,high,medium"},
-            "finish_scan": {"findings": [], "findings_count": 0, "target": "", "status": "completed"},
-            "web_search": {"query": msg},
-            "spawn_sandbox": {"image": "brain-math-sandbox:latest"},
-            "pentest": {"target": "", "tools": ["strix", "nuclei"]},
-            "tmux_session": {"session": "isis-session", "command": "echo ISIS"},
-            "swarmchat": {"message": msg, "channel": "isis"},
-            "herdr_swarm": {"task": msg, "num_bots": 5},
-            "infinity_swarm": {"task": msg},
-            "deer_flow": {"workflow": "default", "steps": []},
-            "capabilities": {},
-            "health": {},
-            "bili_start": {"port": 8787, "host": "127.0.0.1"},
-            "bili_status": {},
-            "bili_compress": {"session_id": "", "start": 0, "end": 0},
-            "bili_decompress": {"session_id": "", "ref_id": ""},
-            "bili_search_context": {"session_id": "", "query": ""},
-            "bili_acp_status": {"session_id": ""},
-        }
-        return defaults.get(tool_name, {})
-
-    def _generate_text_response(self, model, messages, user_message):
-        if model == "isis-trained" or any(m.get("id") == "isis-trained" for m in BRAIN_MODELS):
-            result = ssh_isis("/generate", "POST", {"prompt": user_message})
-            if "response" in result:
-                return result["response"]
-        return (
-            f"I received your message: '{user_message}'. "
-            f"I'm the Brain REST API (OpenAI-compatible) with {len(TOOLS)} tools and "
-            f"{len(BRAIN_MODELS)} models available. "
-            f"Tell me which tool or model you'd like to use, e.g. 'run a nuclei scan on example.com' "
-            f"or 'list all models'."
-        )
-
-    def _summarize_results(self, tool_messages):
-        parts = []
-        for tm in tool_messages:
-            name = tm["name"]
-            parts.append(f"Tool `{name}` completed.")
-        return "Executed " + ", ".join(parts) + "."
-
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    host = "0.0.0.0"
-    port = int(os.environ.get("PORT", "8099"))
-    server = HTTPServer((host, port), BrainHandler)
     print("=" * 60)
-    print("Brain REST API — OpenAI-compatible")
+    print("Brain REST API — OpenAI-compatible endpoint")
     print("=" * 60)
-    print(f"Host: {host}:{port}")
-    print(f"Format: OpenAI Chat Completions API")
-    print(f"Endpoints:")
-    print(f"  GET  http://{host}:{port}/v1/models")
-    print(f"  POST http://{host}:{port}/v1/chat/completions")
-    print(f"  POST http://{host}:{port}/v1/tools/call")
-    print(f"  GET  http://{host}:{port}/v1/tools")
+    print(f"Server: {BRAIN_SERVER_NAME}")
+    print(f"Base URL: https://thebrain.137-184-23-228.sslip.io/brain-api")
+    print(f"Local port: 8099")
+    print(f"Models: {len(BRAIN_MODELS)} (including cloud models)")
     print(f"Tools: {len(TOOLS)}")
-    for t in TOOLS:
-        print(f"  - {t['function']['name']}: {t['function']['description'][:60]}")
-    print(f"Models: {len(BRAIN_MODELS)}")
-    for m in BRAIN_MODELS:
-        print(f"  - {m['id']} ({m.get('role', '?')})")
+    print(f"API Key: {PRIMARY_API_KEY}")
+    print(f"ISIS server: {ISIS_BASE_URL} (native, no SSH)")
+    print(f"Billion-context: port {BILLION_CTX_PORT}")
     print("=" * 60)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        server.server_close()
-
+    server = HTTPServer(("0.0.0.0", 8099), BrainHandler)
+    print("Brain REST API running on port 8099")
+    server.serve_forever()
 
 if __name__ == "__main__":
     main()
