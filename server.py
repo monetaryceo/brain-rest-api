@@ -32,6 +32,16 @@ from urllib.parse import urlparse, parse_qs
 import urllib.request
 import urllib.error
 
+# Load .env file manually (no external deps)
+ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(ENV_FILE):
+    with open(ENV_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
 WORKSPACE = "/home/brain-agent"
 AGENT_TOOLCHAIN = os.path.join(WORKSPACE, "agent-toolchain")
 AGENT_CLI = os.path.join(AGENT_TOOLCHAIN, "bin", "agent-cli.js")
@@ -52,242 +62,112 @@ API_KEYS = {}
 if PRIMARY_API_KEY:
     API_KEYS[PRIMARY_API_KEY] = {"created": int(time.time()), "name": "primary"}
 
-BRAIN_MODELS = [
-    {
-        "id": "lfm3-1.7b-uncensored",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "LFM3-1.7B-Uncensored",
-        "role": "primary",
-        "port": 8081,
-        "file": "lfm3-1.7b-uncensored-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "deepseek-r1-llama-8b-abliterated",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "DeepSeek-R1-Llama-8B-Abliterated",
-        "role": "reasoning",
-        "port": 8086,
-        "file": "deepseek-r1-llama-8b-abliterated-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "reasoning", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "qwen2.5-moe-2x1.5b-uncensored",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "Qwen2.5-MoE-2x1.5B-Uncensored",
-        "role": "moe",
-        "port": 8092,
-        "file": "qwen2.5-moe-2x1.5b-uncensored-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "moe", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "hope",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "HOPE",
-        "role": "quant",
-        "port": 8084,
-        "file": "hope-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "quant", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "aira",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "AIRA",
-        "role": "risk",
-        "port": 8083,
-        "file": "aira-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "risk", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "aether-trading",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "Aether-Trading",
-        "role": "trading",
-        "port": 8081,
-        "file": "aether-trading-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "trading", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "deepseek-r1-qwen-7b-abliterated",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "DeepSeek-R1-Qwen-7B-Abliterated",
-        "role": "reasoning-alt",
-        "port": 8087,
-        "file": "deepseek-r1-qwen-7b-abliterated-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "reasoning", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "wan2.2-ti2v-5b",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "Wan2.2-TI2V-5B",
-        "role": "video",
-        "port": 8088,
-        "file": "wan2.2-ti2v-5b-q4_k_m.gguf",
-        "backend": "diffusers",
-        "capabilities": ["video", "image_generation", "text"],
-        "permission": [],
-    },
-    {
-        "id": "laya-multilingual",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "Laya-Multilingual",
-        "role": "multilingual",
-        "port": 8089,
-        "file": "laya-multilingual-f16.gguf",
-        "backend": "transformers",
-        "capabilities": ["text", "tools", "multilingual", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "jev-style-0.8b-decision-v3",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "Jev-Style-0.8B-Decision-v3",
-        "role": "decision",
-        "port": 8090,
-        "file": "jev-style-0.8b-decision-v3-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "decision", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "jev-style-2b-decision-v3",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "brain",
-        "base": "Jev-Style-2B-Decision-v3",
-        "role": "decision",
-        "port": 8091,
-        "file": "jev-style-2b-decision-v3-q4_k_m.gguf",
-        "capabilities": ["text", "tools", "decision", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "isis-trained",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "isis",
-        "base": "needle3+lfm3-omni",
-        "role": "pentest",
-        "path": "/opt/the-brain/models/isis-trained/isis.safetensors",
-        "uncensored": True,
-        "capabilities": [
-            "web_search", "docker_sandbox", "pentest", "uncensored_response",
-            "strix_recon", "nuclei_vuln_scan", "herdr_bot_swarm", "infinity_swarm",
-            "tmux_session", "deer_flow_workflow", "swarmchat_communication",
-            "abliteration", "quantum_math", "qlora_adapter", "openai_compatible_api",
-        ],
-        "permission": [],
-    },
-    {
-        "id": "llama3.2:1b",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "ollama",
-        "base": "llama3.2",
-        "role": "chat",
-        "endpoint": "http://127.0.0.1:11434",
-        "capabilities": ["text", "tools", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "lfm3-omni",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "liquidai",
-        "base": "LFM3-Omni-2B",
-        "role": "multimodal",
-        "capabilities": ["text", "vision", "audio", "tools", "any_to_any", "chat"],
-        "context_length": 32768,
-        "modality": "any-to-any",
-        "permission": [],
-    },
-    {
-        "id": "openrouter/gpt-4o",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "openrouter",
-        "base": "gpt-4o",
-        "provider": "openrouter",
-        "endpoint": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "capabilities": ["text", "tools", "chat", "vision"],
-        "permission": [],
-    },
-    {
-        "id": "openrouter/claude-3.5-sonnet",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "openrouter",
-        "base": "claude-3.5-sonnet",
-        "provider": "openrouter",
-        "endpoint": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "capabilities": ["text", "tools", "chat", "vision"],
-        "permission": [],
-    },
-    {
-        "id": "openrouter/deepseek-chat-v3",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "openrouter",
-        "base": "deepseek-chat-v3",
-        "provider": "openrouter",
-        "endpoint": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "capabilities": ["text", "tools", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "nvidia/llama-3.1-nemotron-70b",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "nvidia",
-        "base": "llama-3.1-nemotron-70b",
-        "provider": "nvidia",
-        "endpoint": "https://integrate.api.nvidia.com/v1",
-        "api_key_env": "NVIDIA_API_KEY",
-        "capabilities": ["text", "tools", "chat"],
-        "permission": [],
-    },
-    {
-        "id": "nvidia/nemotron-4-340b",
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": "nvidia",
-        "base": "nemotron-4-340b",
-        "provider": "nvidia",
-        "endpoint": "https://integrate.api.nvidia.com/v1",
-        "api_key_env": "NVIDIA_API_KEY",
-        "capabilities": ["text", "tools", "chat"],
-        "permission": [],
-    },
+# ---------------------------------------------------------------------------
+# Dynamic model fetching from cloud providers
+# ---------------------------------------------------------------------------
+
+def fetch_openrouter_models():
+    """Fetch all available models from OpenRouter API"""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        print("WARNING: OPENROUTER_API_KEY not set, skipping OpenRouter models")
+        return []
+    
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+            models = []
+            for m in data.get("data", []):
+                model_id = m.get("id", "")
+                if model_id.startswith("openrouter/") or ":free" in model_id:
+                    continue
+                models.append({
+                    "id": f"openrouter/{model_id}",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "openrouter",
+                    "base": model_id,
+                    "provider": "openrouter",
+                    "endpoint": "https://openrouter.ai/api/v1",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                    "capabilities": ["text", "tools", "chat"],
+                    "permission": [],
+                })
+            print(f"Loaded {len(models)} OpenRouter models")
+            return models
+    except Exception as e:
+        print(f"ERROR fetching OpenRouter models: {e}")
+        return []
+
+def fetch_nvidia_models():
+    """Fetch all available models from NVIDIA API"""
+    api_key = os.environ.get("NVIDIA_API_KEY")
+    if not api_key:
+        print("WARNING: NVIDIA_API_KEY not set, skipping NVIDIA models")
+        return []
+    
+    try:
+        req = urllib.request.Request(
+            "https://integrate.api.nvidia.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+            models = []
+            for m in data.get("data", []):
+                model_id = m.get("id", "")
+                models.append({
+                    "id": f"nvidia/{model_id}",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "nvidia",
+                    "base": model_id,
+                    "provider": "nvidia",
+                    "endpoint": "https://integrate.api.nvidia.com/v1",
+                    "api_key_env": "NVIDIA_API_KEY",
+                    "capabilities": ["text", "tools", "chat"],
+                    "permission": [],
+                })
+            print(f"Loaded {len(models)} NVIDIA models")
+            return models
+    except Exception as e:
+        print(f"ERROR fetching NVIDIA models: {e}")
+        return []
+
+# ---------------------------------------------------------------------------
+# Base local models (hardcoded) - Part 1
+# ---------------------------------------------------------------------------
+
+LOCAL_MODELS = [
+    {"id": "lfm3-1.7b-uncensored", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "LFM3-1.7B-Uncensored", "role": "primary", "port": 8081, "file": "lfm3-1.7b-uncensored-q4_k_m.gguf", "capabilities": ["text", "tools", "chat"], "permission": []},
+    {"id": "deepseek-r1-llama-8b-abliterated", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "DeepSeek-R1-Llama-8B-Abliterated", "role": "reasoning", "port": 8086, "file": "deepseek-r1-llama-8b-abliterated-q4_k_m.gguf", "capabilities": ["text", "tools", "reasoning", "chat"], "permission": []},
+    {"id": "qwen2.5-moe-2x1.5b-uncensored", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "Qwen2.5-MoE-2x1.5B-Uncensored", "role": "moe", "port": 8092, "file": "qwen2.5-moe-2x1.5b-uncensored-q4_k_m.gguf", "capabilities": ["text", "tools", "moe", "chat"], "permission": []},
+    {"id": "hope", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "HOPE", "role": "quant", "port": 8084, "file": "hope-q4_k_m.gguf", "capabilities": ["text", "tools", "quant", "chat"], "permission": []},
+    {"id": "aira", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "AIRA", "role": "risk", "port": 8083, "file": "aira-q4_k_m.gguf", "capabilities": ["text", "tools", "risk", "chat"], "permission": []},
+    {"id": "aether-trading", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "Aether-Trading", "role": "trading", "port": 8081, "file": "aether-trading-q4_k_m.gguf", "capabilities": ["text", "tools", "trading", "chat"], "permission": []},
+    {"id": "deepseek-r1-qwen-7b-abliterated", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "DeepSeek-R1-Qwen-7B-Abliterated", "role": "reasoning-alt", "port": 8087, "file": "deepseek-r1-qwen-7b-abliterated-q4_k_m.gguf", "capabilities": ["text", "tools", "reasoning", "chat"], "permission": []},
+    {"id": "wan2.2-ti2v-5b", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "Wan2.2-TI2V-5B", "role": "video", "port": 8088, "file": "wan2.2-ti2v-5b-q4_k_m.gguf", "backend": "diffusers", "capabilities": ["video", "image_generation", "text"], "permission": []},
+    {"id": "laya-multilingual", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "Laya-Multilingual", "role": "multilingual", "port": 8089, "file": "laya-multilingual-f16.gguf", "backend": "transformers", "capabilities": ["text", "tools", "multilingual", "chat"], "permission": []},
+    {"id": "jev-style-0.8b-decision-v3", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "Jev-Style-0.8B-Decision-v3", "role": "decision", "port": 8090, "file": "jev-style-0.8b-decision-v3-q4_k_m.gguf", "capabilities": ["text", "tools", "decision", "chat"], "permission": []},
+    {"id": "jev-style-2b-decision-v3", "object": "model", "created": int(time.time()), "owned_by": "brain", "base": "Jev-Style-2B-Decision-v3", "role": "decision", "port": 8091, "file": "jev-style-2b-decision-v3-q4_k_m.gguf", "capabilities": ["text", "tools", "decision", "chat"], "permission": []},
+    {"id": "isis-trained", "object": "model", "created": int(time.time()), "owned_by": "isis", "base": "needle3+lfm3-omni", "role": "pentest", "path": "/opt/the-brain/models/isis-trained/isis.safetensors", "uncensored": True, "capabilities": ["web_search", "docker_sandbox", "pentest", "uncensored_response", "strix_recon", "nuclei_vuln_scan", "herdr_bot_swarm", "infinity_swarm", "tmux_session", "deer_flow_workflow", "swarmchat_communication", "abliteration", "quantum_math", "qlora_adapter", "openai_compatible_api"], "permission": []},
+    {"id": "llama3.2:1b", "object": "model", "created": int(time.time()), "owned_by": "ollama", "base": "llama3.2", "role": "chat", "endpoint": "http://127.0.0.1:11434", "capabilities": ["text", "tools", "chat"], "permission": []},
+    {"id": "lfm3-omni", "object": "model", "created": int(time.time()), "owned_by": "liquidai", "base": "LFM3-Omni-2B", "role": "multimodal", "capabilities": ["text", "vision", "audio", "tools", "any_to_any", "chat"], "context_length": 32768, "modality": "any-to-any", "permission": []},
 ]
+
+# Build complete model list: local + cloud
+def build_model_list():
+    """Build the complete model list including dynamically fetched cloud models"""
+    models = LOCAL_MODELS.copy()
+    models.extend(fetch_openrouter_models())
+    models.extend(fetch_nvidia_models())
+    return models
+
+BRAIN_MODELS = build_model_list()
 
 # ---------------------------------------------------------------------------
 # Tool registry — ALL tools (brain MCP + ISIS + billion-context + auth)
