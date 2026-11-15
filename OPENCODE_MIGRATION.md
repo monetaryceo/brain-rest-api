@@ -254,14 +254,15 @@ cd ~/billion-context && git pull
 
 ### Required opencode Setup
 
+The brain REST API exposes its own MCP endpoint at /mcp (HTTP JSON-RPC 2.0) with 26 tools, resources, and prompts. This runs on the server - no local downloads or file creation needed.
+
 Create ~/.opencode/config.json:
 {
   "mcpServers": {
     "brain": {
-      "command": "node",
-      "args": ["/home/brain-agent/agent-toolchain/brain/mcp-server.js"],
+      "command": "npx",
+      "args": ["mcp-proxy", "https://thebrain.137-184-23-228.sslip.io/brain-api/mcp"],
       "env": {
-        "BRAIN_API_URL": "https://thebrain.137-184-23-228.sslip.io/brain-api",
         "BRAIN_API_KEY": "<YOUR_BRAIN_API_KEY>"
       }
     },
